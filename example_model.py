@@ -101,49 +101,70 @@ class NnInferenceClient(BaseInferenceClient):
         self, requests_by_symbol: Dict[str, List[PendingRequest]]
     ) -> InferenceResponse:
         """
-        Process multiple symbols in parallel since each appears at most once.
+        Answer every pending request, batching horizontally across symbols.
+
+        A symbol can have several queued requests, and they must reach the model
+        in list order so its recurrent state advances correctly. So the work is
+        split into rounds: round k takes request index k from every symbol whose
+        list is longer than k, runs those through a single forward pass, and
+        writes the resulting state rows back. Rounds continue until the longest
+        per-symbol list is exhausted. Each round therefore holds a symbol at
+        most once, and every request gets exactly one prediction.
         """
         all_unique_ids = []
         all_predictions = []
-        
-        # Since each symbol appears at most once, we can grab the first request from each
-        batch_indices = []
-        batch_features = []
-        batch_requests = []
-        
-        for symbol, symbol_requests in requests_by_symbol.items():
-            if symbol_requests:
-                # Take first request for this symbol
-                req = symbol_requests[0]
-                idx = self.symbol_to_idx[symbol]
-                
-                batch_indices.append(idx)
-                batch_features.append(req.features)
-                batch_requests.append(req)
-        
-        if batch_indices:
+
+        # Fixed order, so indices and requests stay aligned within every round.
+        symbol_items = [
+            (symbol, reqs) for symbol, reqs in requests_by_symbol.items() if reqs
+        ]
+        if not symbol_items:
+            return InferenceResponse(
+                unique_ids=all_unique_ids,
+                predictions=all_predictions,
+                client_timestamp=time.time()
+            )
+
+        def run_round(batch_indices, batch_features, batch_requests):
+            """One forward pass over at most one request per symbol."""
             # Convert features to tensor
             features_tensor = torch.tensor(
-                batch_features, 
-                device=self.device, 
+                batch_features,
+                device=self.device,
                 dtype=torch.float32
             )
-            
+
             # Extract states for these specific symbols
             active_state = self._extract_batch_state(self.batched_state, batch_indices)
-            
-            # Process ALL symbols in ONE forward pass!
+
+            # Process ALL symbols of this round in ONE forward pass!
             preds, new_state = self.model(features_tensor, active_state)
-            
+
             # Update the batched state for these symbols
             self._update_batch_state(self.batched_state, new_state, batch_indices)
-            
+
             # Collect predictions
             preds_cpu = preds.cpu().numpy()
             for i, req in enumerate(batch_requests):
                 all_unique_ids.append(req.unique_id)
                 all_predictions.append(preds_cpu[i].astype(float).tolist())
-        
+
+        for k in range(max(len(reqs) for _, reqs in symbol_items)):
+            batch_indices = []
+            batch_features = []
+            batch_requests = []
+
+            for symbol, symbol_requests in symbol_items:
+                if len(symbol_requests) > k:
+                    # Take this symbol's k-th queued request
+                    req = symbol_requests[k]
+
+                    batch_indices.append(self.symbol_to_idx[symbol])
+                    batch_features.append(req.features)
+                    batch_requests.append(req)
+
+            run_round(batch_indices, batch_features, batch_requests)
+
         return InferenceResponse(
             unique_ids=all_unique_ids,
             predictions=all_predictions,
