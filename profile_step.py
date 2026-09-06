@@ -83,11 +83,15 @@ def build_round(df: pd.DataFrame, active: int,
                 num_features: int) -> dict[str, list[PendingRequest]]:
     """One request per symbol for the first `active` symbols.
 
-    The shape process_batch wants: Dict[str, List[PendingRequest]], keyed by the
-    same "SYM_%03d" strings NnInferenceClient.symbol_to_idx is built from, with
-    `features` a plain list of Python floats. Every list holds exactly one
-    request, so process_batch's round loop (`for k in range(max(len(reqs)))`)
-    runs once: one forward, one blend, one D2H.
+    The shape process_batch wants: Dict[str, List[PendingRequest]], keyed by
+    "SYM_%03d" strings, with `features` a plain list of Python floats. The
+    client hands a name a state row the first time it sees one, so inserting
+    the names here in index order reproduces the identity mapping the fixed
+    symbol_to_idx used to hardcode: SYM_007 lands on row 7.
+
+    Every list holds exactly one request, so process_batch's round loop
+    (`for k in range(max(len(reqs)))`) runs once: one forward, one blend, one
+    D2H.
 
     The row is padded or truncated to num_features, so a parquet whose feature
     count does not match ModelConfig still produces a runnable batch. Only the

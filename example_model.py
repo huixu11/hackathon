@@ -207,6 +207,22 @@ class NnInferenceClient(BaseInferenceClient):
         device: str | None = None,
         token: str | None = None,
     ):
+        """Build the model and the fixed-shape buffers one round runs against.
+
+        `num_symbols` is a ROW CAPACITY, not a universe. It sizes the batched
+        state and the two device buffers - that is, how many symbols can be
+        tracked at once - and nothing here decides which names those rows
+        belong to. The mapping starts empty and process_batch fills it in on
+        first sight of a name, so the client works against any naming and any
+        universe size at or under the capacity. The evaluator still passes this
+        as num_symbols, so the name stays.
+
+        Rows past the live universe cost memory and almost nothing else: a row
+        no symbol owns is never marked active, the state kernels skip inactive
+        rows, and the per-round cost is dominated by streaming the weights,
+        which happens once however many rows ride along. So the capacity is
+        meant to be set with headroom - about 146 MB of GPU state per row.
+        """
         super().__init__(num_symbols, server_host, server_port)
 
         self.device = device or get_default_device()
@@ -267,11 +283,29 @@ class NnInferenceClient(BaseInferenceClient):
             )
             print(f"Linear layers stay fp32 ({reason})")
 
-        # Initialize a SINGLE batched state for ALL symbols
+        # How many independent recurrent states the device holds. Every buffer
+        # below is this tall, and it never changes for the life of the process.
+        self.capacity = num_symbols
+
+        # Initialize a SINGLE batched state covering every row, owned or not.
         self.batched_state = self.model.init_state(num_symbols, self.device)
 
-        # Map symbols to their position in the batch
-        self.symbol_to_idx = {f"SYM_{i:03d}": i for i in range(num_symbols)}
+        # Symbol -> row in that batch. EMPTY on purpose: rows are handed out by
+        # _row_for on first sight of a name, and never taken back. Seeding it
+        # with {f"SYM_{i:03d}": i} instead assumed both the naming and the size
+        # of the live universe, and any name outside that guess - an unknown
+        # string, or an index at or past the capacity - raised a KeyError in
+        # the middle of process_batch, which the client loop catches and logs
+        # after the whole batch of requests is already lost.
+        self.symbol_to_idx: Dict[str, int] = {}
+
+        # Width of one prediction. MultiTowerModel.forward runs its one
+        # output_proj (hidden_size -> 1) over each tower's output and
+        # concatenates the results along dim 1, so preds is one column per
+        # tower and nothing else. Only the overflow path needs this, to size
+        # the zeros it answers with; every other prediction takes its width
+        # from the preds the model actually returned.
+        self.num_outputs = len(self.model.towers)
 
         # Fixed-shape I/O for process_batch. Every round writes into these same
         # tensors and hands them to the model, so the forward pass sees one
@@ -309,7 +343,7 @@ class NnInferenceClient(BaseInferenceClient):
         self.features_staging = self.features_cpu.numpy()
         self.active_mask_staging = self.active_mask_cpu.numpy()
 
-        print(f"Horizontal batching ready for {num_symbols} symbols!")
+        print(f"Ready: capacity {num_symbols} rows, symbols assigned on first sight")
 
         # Last, because it captures the step: every buffer the step reads or
         # writes has to exist, and hold the address it will hold forever,
@@ -461,6 +495,55 @@ class NnInferenceClient(BaseInferenceClient):
 
         print(f"Step mode: {mode} (warmup {time.perf_counter() - started:.1f} s)")
 
+    # On the class, not the instance: the overflow warning prints once per
+    # process, and stays true afterwards.
+    _overflow_warned = False
+
+    def _row_for(self, symbol: str) -> int | None:
+        """The state row `symbol` owns, taking the next free one on first sight.
+
+        Pure host-side bookkeeping - a dict read, and at most a dict store.
+        Handing a symbol a row deliberately touches nothing on the device: the
+        row still holds exactly what init_state built for it, because no round
+        has ever marked it active, and its mask bit stays false until a round
+        sets it. So no device buffer changes shape, contents or address when a
+        new name shows up, and the captured graph stays valid.
+
+        Rows are handed out densely and never reclaimed - a symbol keeps its
+        row, and therefore its recurrent state, for the life of the process -
+        so the next free row is simply how many are already taken.
+
+        Returns None when the capacity is exhausted, meaning more distinct
+        symbols have arrived than there are rows. That should not happen if the
+        capacity is chosen with headroom, which is cheap to do: an unowned row
+        is skipped by the state kernels and rides along in a pass whose cost is
+        the weight matmuls either way. When it does happen the caller answers
+        with zeros instead of raising, because a raise inside process_batch
+        loses every request in the batch, not just this symbol's.
+        """
+        row = self.symbol_to_idx.get(symbol)
+        if row is not None:
+            return row
+
+        row = len(self.symbol_to_idx)
+        if row >= self.capacity:
+            if not NnInferenceClient._overflow_warned:
+                # Once per process. At ~400 requests a second, a print per
+                # offending request would be its own outage.
+                NnInferenceClient._overflow_warned = True
+                print(
+                    f"WARNING: out of state rows ({self.capacity} of them, all "
+                    f"owned); {symbol!r} and every later new symbol are being "
+                    f"answered with zeros, which is wrong but keeps the rest of "
+                    f"the batch alive. Raise --num-symbols (~146 MB of GPU "
+                    f"memory per row) above the size of the live universe. "
+                    f"This prints once."
+                )
+            return None
+
+        self.symbol_to_idx[symbol] = row
+        return row
+
     @torch.inference_mode()
     def process_batch(
         self, requests_by_symbol: Dict[str, List[PendingRequest]]
@@ -475,7 +558,16 @@ class NnInferenceClient(BaseInferenceClient):
         is exhausted, so each round holds a symbol at most once and every
         request gets exactly one prediction.
 
-        Within a round the model runs over ALL num_symbols rows against the
+        Each symbol is resolved to a row once per call, through self.capacity
+        rows of state. self.symbol_to_idx starts empty and _row_for fills it in
+        on first sight, next free row first, so no naming or universe size is
+        assumed and an unfamiliar name is not an error. A symbol keeps its row
+        forever. If more distinct symbols arrive than there are rows, the ones
+        with no row are answered with zeros and staged nowhere - no row, no
+        mask bit, no state - and a warning prints once; with the capacity set
+        with headroom that path never runs.
+
+        Within a round the model runs over ALL self.capacity rows against the
         whole of self.batched_state, never a subset. A symbol with nothing
         queued this round is fed a row of zeros and marked false in an active
         mask; afterwards the state its row produced is discarded and the state
@@ -505,10 +597,25 @@ class NnInferenceClient(BaseInferenceClient):
         all_unique_ids = []
         all_predictions = []
 
+        # Resolve each symbol to its row once for the whole call, rather than
+        # once per round, and give a row to any name seen for the first time.
         # Fixed order, so indices and requests stay aligned within every round.
-        symbol_items = [
-            (symbol, reqs) for symbol, reqs in requests_by_symbol.items() if reqs
-        ]
+        symbol_items = []
+        for symbol, reqs in requests_by_symbol.items():
+            if not reqs:
+                continue
+            row = self._row_for(symbol)
+            if row is None:
+                # No row left. Answer the requests - dropping them, or letting
+                # a KeyError out of here, costs the whole batch and not just
+                # this symbol - but stage nothing, so the round keeps its shape
+                # and no state is disturbed. _row_for has warned once already.
+                for req in reqs:
+                    all_unique_ids.append(req.unique_id)
+                    all_predictions.append([0.0] * self.num_outputs)
+                continue
+            symbol_items.append((row, reqs))
+
         if not symbol_items:
             return InferenceResponse(
                 unique_ids=all_unique_ids,
@@ -558,12 +665,12 @@ class NnInferenceClient(BaseInferenceClient):
             batch_features = []
             batch_requests = []
 
-            for symbol, symbol_requests in symbol_items:
+            for row, symbol_requests in symbol_items:
                 if len(symbol_requests) > k:
                     # Take this symbol's k-th queued request
                     req = symbol_requests[k]
 
-                    batch_indices.append(self.symbol_to_idx[symbol])
+                    batch_indices.append(row)
                     batch_features.append(req.features)
                     batch_requests.append(req)
 
@@ -627,8 +734,16 @@ def main():
     parser.add_argument(
         "--num-symbols",
         type=int,
-        default=20,
-        help="Number of symbols in the tradeable universe",
+        default=64,
+        help="Number of state rows to allocate - a capacity, not a symbol "
+             "list. Symbols are given a row on first sight, so the naming and "
+             "the size of the live universe need not be known ahead of time. "
+             "Spare rows are cheap: a row no symbol owns is never active, and "
+             "the state kernels skip inactive rows, so it rides along in a "
+             "pass whose cost is the weight matmuls anyway. Each row costs "
+             "about 146 MB of GPU memory, so set this above any plausible "
+             "universe size - a symbol that arrives with no row left is "
+             "answered with zeros.",
     )
     parser.add_argument(
         "--token",
