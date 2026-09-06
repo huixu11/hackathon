@@ -154,7 +154,7 @@ LINEAR_DTYPES = {
     "fp16": torch.float16,
     "fp32": None,  # leave the linears alone
 }
-DEFAULT_LINEAR_DTYPE = "bf16"
+DEFAULT_LINEAR_DTYPE = "fp16"
 
 
 class NnInferenceClient(BaseInferenceClient):
