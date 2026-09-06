@@ -15,7 +15,15 @@ class RGLRU(nn.Module):
         self.recurrence_gate = BlockLinear(num_blocks, hidden_size, bias=False)
         self.a = nn.Parameter(torch.empty(hidden_size))
 
-    def forward(self, x_t: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x_t: torch.Tensor,
+        state: torch.Tensor,
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # mask is accepted and ignored, like SLSTMCell's: the RGLRU state is
+        # (B, hidden), small enough that the client's blend costs nothing, so
+        # nothing is written in place and the caller gets a fresh tensor.
         batch_size, hidden_size = x_t.shape
         assert hidden_size == self.hidden_size
         assert state.shape[0] == batch_size
@@ -50,8 +58,16 @@ class Hawk(nn.Module):
         self.out_proj = nn.Linear(hidden_size, hidden_size, bias=False)
 
     def forward(
-        self, x: torch.Tensor, state: tuple[torch.Tensor, torch.Tensor]
+        self,
+        x: torch.Tensor,
+        state: tuple[torch.Tensor, torch.Tensor],
+        mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        # `mask` is accepted for the common layer signature and threaded down
+        # to the cell, which ignores it. Hawk's state is two small tensors -
+        # the (B, hidden, k-1) conv window and the (B, hidden) RGLRU state - so
+        # there is nothing here worth the in-place masked write that the big
+        # cells do; both leaves come back fresh and the client blends them.
         conv_state, rglru_state = state
 
         batch_size, hidden_size = x.shape
@@ -62,7 +78,7 @@ class Hawk(nn.Module):
         x = self.recurrent_proj(x)
 
         x, new_conv_state = self.conv(x, conv_state)
-        new_rglru_state = self.rglru(x, rglru_state)
+        new_rglru_state = self.rglru(x, rglru_state, mask=mask)
 
         gated = gate * new_rglru_state
         out = self.out_proj(gated)

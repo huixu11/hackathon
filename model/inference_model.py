@@ -60,9 +60,9 @@ class Block(nn.Module):
         self.norm2 = nn.RMSNorm(config.hidden_size)
         self.mlp = SimpleMLP(config.hidden_size, config.proj_size)
 
-    def forward(self, x: torch.Tensor, state):
+    def forward(self, x: torch.Tensor, state, mask=None):
         skip = x
-        x, new_state = self.layer(self.norm1(x), state)
+        x, new_state = self.layer(self.norm1(x), state, mask=mask)
         x = x + skip
         x = x + self.mlp(self.norm2(x))
         return x, new_state
@@ -82,7 +82,7 @@ class Tower(nn.Module):
             [Block(layer_type, config) for _ in range(config.tower_depth)]
         )
 
-    def forward(self, x: torch.Tensor, state):
+    def forward(self, x: torch.Tensor, state, mask=None):
         new_state = []
 
         x = self.input_up(x)
@@ -90,7 +90,7 @@ class Tower(nn.Module):
         x = self.input_down(x)
 
         for block, block_state in zip(self.blocks, state, strict=True):
-            x, new_block_state = block(x, block_state)
+            x, new_block_state = block(x, block_state, mask=mask)
             new_state.append(new_block_state)
         return x, new_state
 
@@ -116,9 +116,25 @@ class MultiTowerModel(nn.Module):
         )
         self.output_proj = nn.Linear(config.hidden_size, 1)
 
-    def forward(self, x: torch.Tensor, state):
+    def forward(self, x: torch.Tensor, state, mask=None):
+        """Run every tower over the whole batch and concatenate their outputs.
+
+        `mask` is either None or a bool (B,) tensor, True for the rows whose
+        recurrent state must advance. It is threaded down to the cells rather
+        than applied out here because the three tensors that dominate the state
+        - the xLSTM mLSTM cell, the Mamba2 ssm_state, the RetNet
+        recurrent_state - can then be updated in place, inside the same kernel
+        that computes them, instead of being written once and re-read twice by
+        a separate blend. Those leaves come back as the SAME tensor objects
+        that went in; every other leaf is a fresh tensor, exactly as before,
+        and the caller folds those itself.
+
+        With mask=None nothing is written in place and the returned state is
+        all fresh tensors, which is the shape training and any non-masked
+        caller expect.
+        """
         results = [
-            tower(x, tower_state)
+            tower(x, tower_state, mask=mask)
             for tower_state, tower in zip(state, self.towers, strict=True)
         ]
         xs, new_state = zip(*results, strict=True)

@@ -30,7 +30,12 @@ class MLSTMCell(nn.Module):
         self.outnorm = nn.GroupNorm(num_groups=num_heads, num_channels=hidden_size)
 
     def forward(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, state: MLSTMCellState
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        state: MLSTMCellState,
+        mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, MLSTMCellState]:
         batch_size, hidden_size = q.shape
 
@@ -64,7 +69,18 @@ class MLSTMCell(nn.Module):
         norm_new = f_gate[:, :, None] * norm_state + i_gate[:, :, None] * k
 
         # Compute output: h = (q @ C) / max(q @ n, 1)
-        numerator = torch.einsum("bnh,bnhk->bnk", q, cell_new)
+        # Same contraction as einsum("bnh,bnhk->bnk", q, cell_new) - dim 2 is h, the
+        # index q shares with the cell - written as a broadcast multiply and a sum so
+        # that it is not an extern kernel. einsum lowers to a bmm, and an extern bmm
+        # fuses with nothing: the cell is written by the update above, read back by
+        # cuBLAS, then read twice more and rewritten by the blend, six passes over the
+        # largest tensor in the model. As a reduction it stays inside inductor, which
+        # can put the update, this contraction and the masked write-back below into one
+        # or two kernels. cell_new has two consumers here (this reduction and the
+        # write-back), so inductor still materializes it; the target is three or four
+        # passes over the cell rather than one, and it is worth confirming against
+        # TORCH_LOGS=output_code that the fusion actually happened.
+        numerator = (q[:, :, :, None] * cell_new).sum(dim=2)
         qn_dotproduct = torch.einsum("bnh,bnh->bn", q, norm_new)
         max_val = torch.exp(-max_new)
         denominator = torch.maximum(qn_dotproduct.abs(), max_val) + self.eps
@@ -77,6 +93,26 @@ class MLSTMCell(nn.Module):
         assert cell_new.shape == cell_state.shape
         assert norm_new.shape == norm_state.shape
         assert max_new.shape == max_state.shape
+
+        if mask is not None:
+            # Every read of cell_state - the update above, and the contraction that
+            # consumes cell_new - is done by this point, so the masked update can land
+            # in place. torch.where builds the blended value first and copy_ then
+            # writes it, so cell_state being both a source and the destination is safe,
+            # and because where selects rather than computes, a nan on an idle row
+            # cannot leak into a kept one. Rows with mask False keep their old value
+            # bit-for-bit, rows with mask True take cell_new. The gain is not that this
+            # write is cheaper than the client's - it moves the same bytes - but that
+            # it sits inside the compiled region, where it can fuse with the update
+            # above; handing back the same tensor object is what makes the client's
+            # _blend_state skip this leaf instead of making those passes a second time.
+            # view(batch_size, ...) and not view(-1, ...): the -1 form accepts a
+            # mask of the wrong length and broadcasts it - a length-1 mask would
+            # advance every row, silently - where naming the batch raises.
+            cell_state.copy_(
+                torch.where(mask.view(batch_size, 1, 1, 1), cell_new, cell_state)
+            )
+            return out, (cell_state, norm_new, max_new)
 
         return out, (cell_new, norm_new, max_new)
 
@@ -128,7 +164,10 @@ class MLSTMBlock(nn.Module):
         self.head_size = self.inner_size // num_heads
 
     def forward(
-        self, x: torch.Tensor, state: MLSTMBlockState
+        self,
+        x: torch.Tensor,
+        state: MLSTMBlockState,
+        mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, MLSTMBlockState]:
         conv_state, mlstm_state = state
 
@@ -145,7 +184,7 @@ class MLSTMBlock(nn.Module):
         k = self.k_proj(x_mlstm_conv)
         v = self.v_proj(x_mlstm)
 
-        mlstm_out, new_mlstm_state = self.mlstm_cell(q, k, v, mlstm_state)
+        mlstm_out, new_mlstm_state = self.mlstm_cell(q, k, v, mlstm_state, mask=mask)
 
         mlstm_out_skip = mlstm_out + (self.learnable_skip * x_mlstm_conv)
         h_state = mlstm_out_skip * F.silu(x_gate)
@@ -175,7 +214,10 @@ class SLSTMCell(nn.Module):
         z: torch.Tensor,
         o: torch.Tensor,
         state: SLSTMCellState,
+        mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, SLSTMCellState]:
+        # mask is accepted and ignored: every sLSTM state leaf is (B, hidden), small
+        # enough that the client's blend costs nothing, so nothing is written in place.
         cell_state, norm_state, max_state = state
 
         log_f_plus_m = max_state + torch.nn.functional.logsigmoid(f)
@@ -227,6 +269,7 @@ class SLSTMBlock(nn.Module):
         self,
         x: torch.Tensor,
         state: SLSTMBlockState,
+        mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, SLSTMBlockState]:
         conv_state, recurrent_state, slstm_state = state
 
@@ -241,7 +284,9 @@ class SLSTMBlock(nn.Module):
         z = self.zgate_input(x) + self.zgate_state(recurrent_state)
         o = self.ogate_input(x) + self.ogate_state(recurrent_state)
 
-        new_recurrent_state, new_slstm_state = self.slstm_cell(i, f, z, o, slstm_state)
+        new_recurrent_state, new_slstm_state = self.slstm_cell(
+            i, f, z, o, slstm_state, mask=mask
+        )
         slstm_out = self.group_norm(new_recurrent_state)
 
         return slstm_out + skip, (new_conv_state, new_recurrent_state, new_slstm_state)
@@ -271,11 +316,14 @@ class XLSTM(nn.Module):
         self.final_norm = nn.LayerNorm(hidden_size, bias=False)
 
     def forward(
-        self, x: torch.Tensor, state: XLSTMState
+        self,
+        x: torch.Tensor,
+        state: XLSTMState,
+        mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, XLSTMState]:
         slstm_state, mlstm_state = state
-        x, new_slstm_state = self.slstm(x, slstm_state)
-        x, new_mlstm_state = self.mlstm(x, mlstm_state)
+        x, new_slstm_state = self.slstm(x, slstm_state, mask=mask)
+        x, new_mlstm_state = self.mlstm(x, mlstm_state, mask=mask)
 
         out = self.final_norm(x)
         new_state = (new_slstm_state, new_mlstm_state)

@@ -62,6 +62,7 @@ class Mamba2(nn.Module):
         self,
         t: torch.Tensor,
         state: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        mask: torch.Tensor | None = None,
     ):
         batch_size = t.shape[0]
 
@@ -92,11 +93,18 @@ class Mamba2(nn.Module):
         #  x  is [batch_size, head_size]
         # The new contribution (and ssm_state) is [batch_size, num_heads, head_size, bc_head_size]
         new_state_contrib = dt[:, :, None, None] * b[:, None, None] * x[:, :, :, None]
-        ssm_state = decay[:, :, None, None] * ssm_state + new_state_contrib
+        # Keep the old ssm_state addressable: the masked write-back below needs it,
+        # and it is the tensor we update in place.
+        ssm_new = decay[:, :, None, None] * ssm_state + new_state_contrib
 
         # output computation: y[t] = C @ h[t] + D * x[t]
-        # The accumulation in the product of C and h[t] is on the bc_head_size dimension
-        state_contrib = torch.einsum("bc,bnhc->bnh", c, ssm_state)
+        # The accumulation in the product of C and h[t] is on the bc_head_size dimension.
+        # This is torch.einsum("bc,bnhc->bnh", c, ssm_new), written as a broadcast
+        # multiply plus a reduction over the last (contiguous) dim so inductor lowers it
+        # to a fused reduction instead of an extern bmm: the state update above, this
+        # contraction and the write-back below then read the (B, num_heads, head_size,
+        # bc_head_size) state once or twice instead of three to six times.
+        state_contrib = (c[:, None, None, :] * ssm_new).sum(dim=-1)
         # d has shape [num_heads], broadcasting it to the shape of x.
         y = state_contrib + self.d[None, :, None] * x
 
@@ -107,5 +115,19 @@ class Mamba2(nn.Module):
         y = self.norm(y)
         output = self.out_proj(y)
 
-        new_state = [x_conv_state, b_conv_state, c_conv_state, ssm_state]
+        # Masked write-back, after every read of the old ssm_state is done. Updating the
+        # big state in place here lets the client skip blending this leaf (it compares by
+        # identity), so the update, the contraction and the write-back can fuse instead of
+        # each making its own pass over the state. Rows with mask False keep their old
+        # value bit-for-bit. The small conv states stay fresh tensors and are blended by
+        # the client as before.
+        if mask is not None:
+            ssm_state.copy_(
+                torch.where(mask.view(batch_size, 1, 1, 1), ssm_new, ssm_state)
+            )
+            ssm_out = ssm_state
+        else:
+            ssm_out = ssm_new
+
+        new_state = [x_conv_state, b_conv_state, c_conv_state, ssm_out]
         return output, new_state

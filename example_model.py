@@ -176,16 +176,20 @@ def iter_state_tensors(state):
         yield state
 
 
-# Values accepted in the STEP_MODE environment variable. All three produce a
+# Values accepted in the STEP_MODE environment variable. All four produce a
 # self._step_fn() that runs the forward pass and folds the new state in; they
 # differ only in how much per-round launch overhead is paid to do it.
 #
 #   inductor   torch.compile(mode="reduce-overhead"): inductor's kernels,
 #              replayed by cudagraph trees.
 #   cudagraph  the eager kernels, captured once by hand into a CUDA graph.
+#   compile    torch.compile with the default mode: inductor's kernels, but no
+#              CUDA graphs, so each one is launched on its own. Slower than
+#              inductor and meant for profiling - the profiler sees the fused
+#              kernels individually, by name, instead of one graph launch.
 #   eager      no capture at all - the reference path, and the only one that
 #              runs anywhere but CUDA.
-STEP_MODES = ("inductor", "cudagraph", "eager")
+STEP_MODES = ("inductor", "cudagraph", "compile", "eager")
 DEFAULT_STEP_MODE = "inductor"
 
 # Enough passes to settle whatever is autotuned before the graph is recorded:
@@ -324,9 +328,16 @@ class NnInferenceClient(BaseInferenceClient):
         caller copies it to the host immediately, and a clone per round would
         put an allocation back into the path this exists to shorten.
         """
-        preds, new_state = self.model(self.features_buf, self.batched_state)
+        preds, new_state = self.model(
+            self.features_buf, self.batched_state, mask=self.active_mask
+        )
 
-        # Fold the rows that ran into the live state, using the same mask.
+        # Fold the rows that ran into the live state, using the same mask the
+        # model just ran under. The three big leaves - the xLSTM mLSTM cell,
+        # the Mamba2 ssm_state, the RetNet recurrent_state - are already folded
+        # by then: their cells took the mask and wrote them in place, and hand
+        # back the very tensor that went in, so the blend below sees `new is
+        # old` and skips them. It only writes the small leaves.
         # An idle row can come back as garbage or nan - SLSTM's running max
         # starts at -inf, and a row of zero features is not a meaningful event
         # for any of the towers - but the mask throws that row away, and no
@@ -339,10 +350,10 @@ class NnInferenceClient(BaseInferenceClient):
     def _stage_idle_round(self) -> None:
         """Push a round in which no symbol is active into the device buffers.
 
-        A mask of all false makes _blend_state write old into old on every
-        leaf, so a step run this way leaves batched_state exactly as it found
-        it - which is what makes it safe to run the warmup passes before the
-        first real request has arrived.
+        A mask of all false makes every masked write - the cells' in-place ones
+        and _blend_state's - write old into old, so a step run this way leaves
+        batched_state exactly as it found it, which is what makes it safe to
+        run the warmup passes before the first real request has arrived.
         """
         self.features_staging[:] = 0.0
         self.active_mask_staging[:] = False
@@ -369,8 +380,9 @@ class NnInferenceClient(BaseInferenceClient):
             mode = DEFAULT_STEP_MODE
 
         if not is_cuda and mode != "eager":
-            # Both graph modes are CUDA-only: mark_static_address exists to
-            # feed cudagraph trees, and CUDAGraph has no CPU or MPS analogue.
+            # Every mode but eager is CUDA-only here: mark_static_address
+            # exists to feed cudagraph trees, CUDAGraph has no CPU or MPS
+            # analogue, and the warmup loops synchronize the CUDA stream.
             print(
                 f"STEP_MODE={mode} needs CUDA; device is "
                 f"{torch.device(self.device).type}, so the step runs eager"
@@ -382,12 +394,13 @@ class NnInferenceClient(BaseInferenceClient):
         if mode == "eager":
             self._step_fn = self._step
 
-        elif mode == "inductor":
+        elif mode in ("inductor", "compile"):
             # cudagraph trees will not replay against an input it thinks might
             # be reallocated, and it decides that from the address. These
             # buffers are written in place forever and never rebound, so say
             # so; without it the in-place mutation of the state makes it skip
-            # CUDA graphs silently and only the kernel fusion is left.
+            # CUDA graphs silently and only the kernel fusion is left. Under
+            # "compile" there are no graphs to feed and the marks cost nothing.
             #
             # torch._dynamo is a lazily imported submodule, so pull it in
             # before reaching through torch for it. `from torch import` and not
@@ -400,8 +413,14 @@ class NnInferenceClient(BaseInferenceClient):
             torch._dynamo.mark_static_address(self.features_buf)
             torch._dynamo.mark_static_address(self.active_mask)
 
+            # Same compiler, same fused kernels; "inductor" adds cudagraph
+            # trees on top and "compile" leaves them off, which is the whole
+            # point of the latter - one launch per kernel is slower to run and
+            # legible to the profiler, which sees each fused kernel by name
+            # rather than a single graph replay.
+            compile_kwargs = {"mode": "reduce-overhead"} if mode == "inductor" else {}
             self._step_fn = torch.compile(
-                self._step, mode="reduce-overhead", fullgraph=False
+                self._step, fullgraph=False, **compile_kwargs
             )
 
             # Warm up the way process_batch will call it. Dynamo guards on the
@@ -409,8 +428,8 @@ class NnInferenceClient(BaseInferenceClient):
             # compile away and pay it again on the first real request.
             with torch.inference_mode():
                 for _ in range(WARMUP_STEPS):
-                    # Mask all false, so the blend copies old into old and
-                    # batched_state comes out of the warmup unchanged.
+                    # Mask all false, so every masked write copies old into old
+                    # and batched_state comes out of the warmup unchanged.
                     self._stage_idle_round()
                     self._step_fn()
                     torch.cuda.synchronize()
@@ -470,7 +489,14 @@ class NnInferenceClient(BaseInferenceClient):
           - No gather, no scatter. Pulling the active rows out of the state and
             writing them back used to cost two index kernels per state tensor
             per round - hundreds of launches each moving a few kilobytes, which
-            is nearly all launch overhead.
+            is nearly all launch overhead. The mask now goes into the model
+            itself, and the three big leaves - one per block in three of the
+            four towers: the xLSTM mLSTM cell, the Mamba2 ssm_state and the
+            RetNet recurrent_state, together about 98% of the 5.6 GB of state
+            at 39 rows - are written in place by their own cells, inside the
+            kernel that computes them. _blend_state sees those come back as the
+            same tensor object and skips them; it only handles the small
+            leaves, so the round no longer re-reads gigabytes to fold them.
           - The idle rows are close to free. At this batch size the pass is
             bandwidth bound on streaming the weights out of HBM, and the weights
             are read once however many rows ride along; only the recurrent
@@ -556,6 +582,13 @@ class NnInferenceClient(BaseInferenceClient):
         the model hands back exactly what init_state built, list for list and
         tuple for tuple, down to the RetNet counter and the xLSTM cells.
 
+        A leaf where `new` is literally `old` is already done and is skipped:
+        that is how the three big state tensors come back now, written in place
+        by their own cells under this same mask so the value never has to be
+        streamed out and read back in again. What is left for this walk is the
+        small leaves - conv windows, RGLRU and sLSTM state, the RetNet offset
+        counter - which are cheap enough that the extra pass does not matter.
+
         Each leaf is written with copy_ rather than rebound, so every tensor in
         self.batched_state keeps its identity and its address across rounds.
         That is not tidiness - a captured CUDA graph replays against the
@@ -579,6 +612,10 @@ class NnInferenceClient(BaseInferenceClient):
             for key in old:
                 self._blend_state(old[key], new[key], mask)
         elif isinstance(old, torch.Tensor):
+            # Same object on both sides: the cell already wrote this leaf in
+            # place, under this same mask, so there is nothing left to fold.
+            if new is old:
+                return
             mask_view = mask.view(mask.shape[0], *(1,) * (old.dim() - 1))
             old.copy_(torch.where(mask_view, new, old))
 

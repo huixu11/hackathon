@@ -10,9 +10,19 @@ Measures only - no accuracy, no server. Run from the repo root.
 
     python profile_step.py                            # eager, all symbols active
     python profile_step.py --active 8 --rounds 20     # 8 active, rest masked off
+    python profile_step.py --step-mode compile --rounds 20     # fused kernels, by name
     python profile_step.py --step-mode cudagraph --rounds 20   # wall clock only
     python profile_step.py --num-symbols 128 --rounds 20
     python profile_step.py --requests-parquet-file small.parquet --token hf_xxx
+
+The per-label rows at the bottom are only reliable under --step-mode eager:
+those record_function ranges sit inside the region torch.compile traces, and
+dynamo is free to drop a profiler context it traces through, in which case the
+rows print "n/a (range never entered)". What --step-mode compile buys is the
+table above them - with no cudagraphs each of inductor's fused kernels is
+launched on its own, so kineto names them one at a time. cudagraph and inductor
+both collapse the whole step into a single launch, so under those only the wall
+clock is real.
 
 Nothing here writes to the repo and nothing here touches example_model.py or
 model/ on disk; the record_function labels are installed on the live objects,
@@ -61,7 +71,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--step-mode", type=str, default="eager", choices=STEP_MODES,
                    help="Written to STEP_MODE before the client reads it. The "
                         "client's own default is inductor; this defaults to "
-                        "eager, the only mode the per-label attribution works in.")
+                        "eager, the only mode the per-label attribution is "
+                        "reliable in. compile names the fused kernels instead.")
     p.add_argument("--row-limit", type=int, default=25,
                    help="Rows of the key_averages table to print.")
     p.add_argument("--token", type=str, default=None, help="Hugging Face token.")
@@ -115,8 +126,11 @@ def state_stats(state) -> tuple[int, int, int]:
     counted separately, exactly as the blend walks past it.
 
     Bytes are deduped by data_ptr so an aliased leaf is not counted twice. The
-    leaf count is deliberately not deduped: the blend runs a torch.where plus a
-    copy_ per occurrence, so it is a lower bound on the blend's launches.
+    leaf count is deliberately not deduped: the blend runs at most one
+    torch.where plus one copy_ per occurrence, so twice it bounds the blend's
+    launches from above. It is only a bound and no longer the count, because a
+    leaf its cell already wrote in place under the mask comes back by identity
+    and the blend skips it.
     """
     total = tensors = others = 0
     seen: set[int] = set()
@@ -150,8 +164,9 @@ def record_wrapper(fn, label: str):
     path, and the guard is a no-op for them.
 
     *args/**kwargs, so the wrapper carries whatever signature the wrapped
-    callable had: Tower.forward's (x, state) and _blend_state's (old, new,
-    mask). Both are wrapped as already-bound methods, so neither takes self.
+    callable had: Tower.forward's (x, state, mask=...) - the mask arrives as a
+    keyword and passes straight through - and _blend_state's (old, new, mask).
+    Both are wrapped as already-bound methods, so neither takes self.
     """
     inside = False
 
@@ -297,8 +312,10 @@ def main() -> None:
         print(f"  {label:<14} {t_bytes / 1024**3:7.3f} GB  "
               f"{t_bytes / num_symbols / 1024**2:7.3f} MB/symbol  "
               f"{t_tensors:4d} tensors  ({100 * t_bytes / max(nbytes, 1):5.1f}%)")
-    print(f"  the blend costs >= {2 * tensors} launches per round "
-          f"(one torch.where plus one copy_ per tensor leaf)")
+    print(f"  the blend costs <= {2 * tensors} launches per round (one "
+          f"torch.where plus one copy_ per tensor leaf); every leaf its cell "
+          f"already wrote in place under the mask comes back by identity and "
+          f"is skipped, so the real count is lower")
     print(f"  cuda memory: {torch.cuda.memory_allocated() / 1024**3:.3f} GB allocated, "
           f"{torch.cuda.memory_reserved() / 1024**3:.3f} GB reserved")
 
@@ -366,9 +383,14 @@ def main() -> None:
             labelled_us += total_us
             print(f"  {label:<14} {total_us / 1000 / profile_rounds:8.2f} ms")
         print(f"  {'labelled sum':<14} {labelled_us / 1000 / profile_rounds:8.2f} ms")
-        print("note: only meaningful with --step-mode eager. Under cudagraph the whole\n"
-              "      step is one graph launch, and under inductor it is fused kernels\n"
-              "      replayed by cudagraph trees, so the per-label time collapses.")
+        print("note: reliable with --step-mode eager. These ranges sit inside the\n"
+              "      region torch.compile traces, and dynamo may drop a profiler\n"
+              "      context it traces through, so under compile they can come back\n"
+              "      'n/a' - the fused-kernel rows in the table above are what that\n"
+              "      mode is for. Under cudagraph the whole step is one graph launch,\n"
+              "      and under inductor it is fused kernels replayed by cudagraph\n"
+              "      trees, so there the per-label times and the per-kernel rows\n"
+              "      both collapse.")
     except Exception:
         print("\nthe profiler section failed; the timings above still stand.")
         traceback.print_exc()
