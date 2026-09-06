@@ -157,6 +157,43 @@ LINEAR_DTYPES = {
 DEFAULT_LINEAR_DTYPE = "fp16"
 
 
+def iter_state_tensors(state):
+    """Yield every tensor leaf of a state tree, in _blend_state's walk order.
+
+    Same container zoo as the blend sees: the towers are lists, a block's state
+    is whatever its layer returned (a tuple for RetNet and xLSTM, a list for
+    Mamba2 and Hawk, sometimes a bare tensor), and dicts are handled for the
+    same reason _blend_state handles them - nothing in the model builds one
+    today, but if one appears the two walks should still agree.
+    """
+    if isinstance(state, (list, tuple)):
+        for leaf in state:
+            yield from iter_state_tensors(leaf)
+    elif isinstance(state, dict):
+        for leaf in state.values():
+            yield from iter_state_tensors(leaf)
+    elif isinstance(state, torch.Tensor):
+        yield state
+
+
+# Values accepted in the STEP_MODE environment variable. All three produce a
+# self._step_fn() that runs the forward pass and folds the new state in; they
+# differ only in how much per-round launch overhead is paid to do it.
+#
+#   inductor   torch.compile(mode="reduce-overhead"): inductor's kernels,
+#              replayed by cudagraph trees.
+#   cudagraph  the eager kernels, captured once by hand into a CUDA graph.
+#   eager      no capture at all - the reference path, and the only one that
+#              runs anywhere but CUDA.
+STEP_MODES = ("inductor", "cudagraph", "eager")
+DEFAULT_STEP_MODE = "inductor"
+
+# Enough passes to settle whatever is autotuned before the graph is recorded:
+# inductor's kernel selection, cudnn.benchmark's algorithm search, and the
+# allocator blocks the capture will bake in.
+WARMUP_STEPS = 3
+
+
 class NnInferenceClient(BaseInferenceClient):
     def __init__(
         self,
@@ -270,6 +307,141 @@ class NnInferenceClient(BaseInferenceClient):
 
         print(f"Horizontal batching ready for {num_symbols} symbols!")
 
+        # Last, because it captures the step: every buffer the step reads or
+        # writes has to exist, and hold the address it will hold forever,
+        # before the pass can be compiled or recorded.
+        self._setup_step_fn(is_cuda)
+
+    def _step(self) -> torch.Tensor:
+        """One forward pass over the whole batch, plus the state blend.
+
+        Takes no arguments and reads self.features_buf, self.batched_state and
+        self.active_mask directly, so the addresses it runs against are the
+        same on every call - that, plus the single fixed shape, is what lets
+        the whole thing be captured once and replayed.
+
+        Returns preds as the model produced it, deliberately not cloned: the
+        caller copies it to the host immediately, and a clone per round would
+        put an allocation back into the path this exists to shorten.
+        """
+        preds, new_state = self.model(self.features_buf, self.batched_state)
+
+        # Fold the rows that ran into the live state, using the same mask.
+        # An idle row can come back as garbage or nan - SLSTM's running max
+        # starts at -inf, and a row of zero features is not a meaningful event
+        # for any of the towers - but the mask throws that row away, and no
+        # operator in the model mixes rows (every norm here is per-sample, the
+        # convs are depthwise, the einsums keep b on both sides), so the
+        # symbols that did run are untouched by it.
+        self._blend_state(self.batched_state, new_state, self.active_mask)
+        return preds
+
+    def _stage_idle_round(self) -> None:
+        """Push a round in which no symbol is active into the device buffers.
+
+        A mask of all false makes _blend_state write old into old on every
+        leaf, so a step run this way leaves batched_state exactly as it found
+        it - which is what makes it safe to run the warmup passes before the
+        first real request has arrived.
+        """
+        self.features_staging[:] = 0.0
+        self.active_mask_staging[:] = False
+        self.features_buf.copy_(self.features_cpu, non_blocking=True)
+        self.active_mask.copy_(self.active_mask_cpu, non_blocking=True)
+
+    def _replay_graph(self) -> torch.Tensor:
+        """Replay the captured step and hand back the tensor it writes into.
+
+        Always the same tensor object at the same address, because that is what
+        the graph recorded; the caller has to read it before the next replay.
+        """
+        self._graph.replay()
+        return self._static_preds
+
+    def _setup_step_fn(self, is_cuda: bool) -> None:
+        """Choose how _step runs, and pay whatever warmup that choice costs."""
+        mode = os.environ.get("STEP_MODE", DEFAULT_STEP_MODE).strip().lower()
+        if mode not in STEP_MODES:
+            print(
+                f"STEP_MODE={mode!r} is not one of {sorted(STEP_MODES)}; "
+                f"falling back to {DEFAULT_STEP_MODE}"
+            )
+            mode = DEFAULT_STEP_MODE
+
+        if not is_cuda and mode != "eager":
+            # Both graph modes are CUDA-only: mark_static_address exists to
+            # feed cudagraph trees, and CUDAGraph has no CPU or MPS analogue.
+            print(
+                f"STEP_MODE={mode} needs CUDA; device is "
+                f"{torch.device(self.device).type}, so the step runs eager"
+            )
+            mode = "eager"
+
+        started = time.perf_counter()
+
+        if mode == "eager":
+            self._step_fn = self._step
+
+        elif mode == "inductor":
+            # cudagraph trees will not replay against an input it thinks might
+            # be reallocated, and it decides that from the address. These
+            # buffers are written in place forever and never rebound, so say
+            # so; without it the in-place mutation of the state makes it skip
+            # CUDA graphs silently and only the kernel fusion is left.
+            #
+            # torch._dynamo is a lazily imported submodule, so pull it in
+            # before reaching through torch for it. `from torch import` and not
+            # `import torch._dynamo`, which would rebind `torch` as a local for
+            # the whole of this method.
+            from torch import _dynamo  # noqa: F401
+
+            for tensor in iter_state_tensors(self.batched_state):
+                torch._dynamo.mark_static_address(tensor)
+            torch._dynamo.mark_static_address(self.features_buf)
+            torch._dynamo.mark_static_address(self.active_mask)
+
+            self._step_fn = torch.compile(
+                self._step, mode="reduce-overhead", fullgraph=False
+            )
+
+            # Warm up the way process_batch will call it. Dynamo guards on the
+            # grad mode, so warming up outside inference_mode would throw the
+            # compile away and pay it again on the first real request.
+            with torch.inference_mode():
+                for _ in range(WARMUP_STEPS):
+                    # Mask all false, so the blend copies old into old and
+                    # batched_state comes out of the warmup unchanged.
+                    self._stage_idle_round()
+                    self._step_fn()
+                    torch.cuda.synchronize()
+
+        elif mode == "cudagraph":
+            with torch.inference_mode():
+                # Mask all false, so the blend copies old into old and
+                # batched_state comes out of warmup and capture unchanged.
+                self._stage_idle_round()
+
+                # The warmup has to run on a side stream: capture records the
+                # allocations the step makes, and the caching allocator only
+                # hands out capture-safe blocks for a stream it has already
+                # seen the step run on.
+                s = torch.cuda.Stream()
+                s.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(s):
+                    for _ in range(WARMUP_STEPS):
+                        self._step()
+                torch.cuda.current_stream().wait_stream(s)
+
+                # Capture under inference_mode too, so the kernels recorded are
+                # the ones the real calls would have run.
+                self._graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(self._graph):
+                    self._static_preds = self._step()
+
+            self._step_fn = self._replay_graph
+
+        print(f"Step mode: {mode} (warmup {time.perf_counter() - started:.1f} s)")
+
     @torch.inference_mode()
     def process_batch(
         self, requests_by_symbol: Dict[str, List[PendingRequest]]
@@ -291,9 +463,10 @@ class NnInferenceClient(BaseInferenceClient):
         it already had is kept. Three things come out of that:
 
           - The forward pass has one shape for the life of the process instead
-            of a new shape every round, which is the precondition for capturing
-            it as a CUDA graph later. Static addresses are the other half, and
-            the blend below preserves those.
+            of a new shape every round, which is half of what capturing it as a
+            CUDA graph needs. Static addresses are the other half, and the
+            blend inside _step preserves those; _setup_step_fn does the
+            capturing.
           - No gather, no scatter. Pulling the active rows out of the state and
             writing them back used to cost two index kernels per state tensor
             per round - hundreds of launches each moving a few kilobytes, which
@@ -337,22 +510,18 @@ class NnInferenceClient(BaseInferenceClient):
             self.features_buf.copy_(self.features_cpu, non_blocking=True)
             self.active_mask.copy_(self.active_mask_cpu, non_blocking=True)
 
-            # ONE forward pass, always the full batch, always the same shape.
-            preds, new_state = self.model(self.features_buf, self.batched_state)
+            # ONE forward pass plus the state blend, always the full batch,
+            # always the same shape - eager, compiled, or a replay of the
+            # captured graph, depending on STEP_MODE.
+            preds = self._step_fn()
 
-            # Fold the rows that ran into the live state, using the same mask.
-            # An idle row can come back as garbage or nan - SLSTM's running max
-            # starts at -inf, and a row of zero features is not a meaningful
-            # event for any of the towers - but the mask throws that row away,
-            # and no operator in the model mixes rows (every norm here is
-            # per-sample, the convs are depthwise, the einsums keep b on both
-            # sides), so the symbols that did run are untouched by it.
-            self._blend_state(self.batched_state, new_state, self.active_mask)
-
-            # A single D2H copy for the whole (num_symbols, 4) block; the active
-            # rows are then picked out by index on the host. .cpu() also
+            # Immediately, and before anything else runs: in the graph modes
+            # preds is the same device tensor every round, so its value has to
+            # be read before the next replay overwrites it. .cpu() also
             # synchronizes the stream, which is what makes it safe for the next
-            # round to overwrite the staging buffers the async copies read from.
+            # round to overwrite the staging buffers the async copies read
+            # from. A single D2H copy for the whole (num_symbols, 4) block; the
+            # active rows are then picked out by index on the host.
             preds_cpu = preds.cpu().numpy()
             for req, symbol_idx in zip(batch_requests, batch_indices):
                 all_unique_ids.append(req.unique_id)
