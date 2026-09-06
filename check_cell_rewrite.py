@@ -22,6 +22,23 @@ Checked per layer type (xLSTM, Mamba2, RetNet, Hawk) and for MultiTowerModel:
   * the whole-model masked step also runs inside torch.inference_mode(), and on
     CUDA under torch.compile
 
+Which new-side code path that exercises depends on the machine and on
+CELL_KERNELS. The three big cells take their Triton path only when the mask is
+not None AND model.kernels.ENABLED AND the state is on CUDA, so:
+
+  * on CPU, or wherever triton is missing, every masked step above runs the
+    pure-torch fallback and this compares the rewrite alone;
+  * on CUDA with triton installed, the default run puts the fused Triton
+    kernels under every masked step - so a failure here is either the rewrite
+    or the kernels, and there is no way to tell from one run;
+  * --no-kernels sets CELL_KERNELS=torch before model is imported, which pins
+    ENABLED to False and forces the fallback on CUDA too.
+
+Run it both ways. A failure with --no-kernels is a real rewrite regression; a
+failure only without it is the kernels' reassociation (they sum the contraction
+as a tile tree, where the torch path sums it in one reduction), and belongs to
+model/kernels.py. mask=None never reaches a kernel on either setting.
+
 Weights are randomized here - several parameters ship as torch.empty and are
 only ever filled by the checkpoint - so this proves the code equivalent, not
 the checkpoint accurate. Run local_evaluator.py on tiny.parquet for that, with
@@ -29,7 +46,8 @@ a partially-false mask.
 
 Usage:
     python check_cell_rewrite.py
-    python check_cell_rewrite.py --ref 3b2e25c --device cuda
+    python check_cell_rewrite.py --ref 3b2e25c --device cuda   # Triton path
+    python check_cell_rewrite.py --device cuda --no-kernels    # torch fallback
     python check_cell_rewrite.py --bench       # CUDA only, real sizes, B=39
 """
 
@@ -39,6 +57,7 @@ import argparse
 import contextlib
 import importlib
 import math
+import os
 import subprocess
 import sys
 import tempfile
@@ -50,6 +69,14 @@ import torch
 REPO = Path(__file__).resolve().parent
 PKG_FILES = ("__init__.py", "modules.py", "xlstm.py", "mamba2.py", "retnet.py",
              "hawk.py", "inference_model.py")
+# Copied out only when the ref actually has them, and never imported here.
+# kernels.py cannot go in PKG_FILES: the default ref predates it, and load_old
+# raises on a missing file, so an unconditional entry would break the default
+# run. A ref from after the kernel work does have it, and its cells import it at
+# module scope, so the copy has to happen for those refs or oldmodel will not
+# import at all. Note that an oldmodel with kernels.py reads the same
+# CELL_KERNELS this process set, so --no-kernels pins both sides to torch.
+OPTIONAL_FILES = ("kernels.py",)
 BIG_DIM = 4  # the three tensors this rewrite is about are the only 4-D leaves
 OLD: dict = {}
 NEW: dict = {}
@@ -66,6 +93,11 @@ def load_old(ref: str, tmp: Path) -> dict:
             raise SystemExit(f"git show {ref}:model/{name} failed: "
                              f"{r.stderr.decode(errors='replace').strip()}")
         (pkg / name).write_bytes(r.stdout)  # relative imports work inside a package
+    for name in OPTIONAL_FILES:
+        r = subprocess.run(["git", "show", f"{ref}:model/{name}"],
+                           cwd=REPO, capture_output=True)
+        if r.returncode == 0:
+            (pkg / name).write_bytes(r.stdout)
     sys.path.insert(0, str(tmp))
     return {f[:-3]: importlib.import_module(f"oldmodel.{f[:-3]}") for f in PKG_FILES[1:]}
 
@@ -275,6 +307,14 @@ def masked_case(name, build, width, steps, dev, atol, rtol, batch=6, inference=F
             blend_client(s_new, ret_new, mask)
 
         chk.cmp(f"step {step} out", out_old[mask], out_new[mask])
+        # cmp alone can pass vacuously: assert_close reads two matching infs as
+        # equal, so if both paths blew up identically nothing above would say
+        # so. This is also the check that names an idle row leaking into an
+        # active one - the two paths give an idle row different garbage (zeros
+        # from the kernels, whatever the arithmetic produced from torch), so a
+        # leak shows up here before it shows up as a mismatch.
+        if not torch.isfinite(out_new[mask]).all():
+            chk.note(f"step {step}: an active row of the new output is not finite")
         for i, (a, b) in enumerate(zip(leaves(s_old), leaves(s_new), strict=True)):
             chk.cmp(f"step {step} state leaf {i}", a, b)
         idle = ~mask
@@ -424,7 +464,21 @@ def main() -> int:
     ap.add_argument("--ref", default="3b2e25c", help="git ref holding the old model/")
     ap.add_argument("--device", default=None, help="cpu or cuda (default: cuda if there)")
     ap.add_argument("--bench", action="store_true", help="also time real sizes (CUDA)")
+    ap.add_argument("--no-kernels", action="store_true",
+                    help="set CELL_KERNELS=torch before importing model, so the "
+                         "cells take their pure-torch fallback even on CUDA")
     args = ap.parse_args()
+
+    # Before load_new(), which is the first thing in this process to import
+    # model.kernels - and model.kernels reads CELL_KERNELS exactly once, at
+    # import, to decide ENABLED. Setting it any later would be silently
+    # ignored, so assert nothing imported model behind our back.
+    if args.no_kernels:
+        os.environ["CELL_KERNELS"] = "torch"
+    assert not any(m == "model" or m.startswith("model.") for m in sys.modules), (
+        "model was imported before CELL_KERNELS could be set; --no-kernels "
+        "would have had no effect"
+    )
 
     torch.set_grad_enabled(False)
     dev = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -442,6 +496,16 @@ def main() -> int:
         NEW.update(load_new())
         print(f"torch {torch.__version__}, device {dev}, old package from "
               f"{args.ref}, atol {atol:g} rtol {rtol:g}")
+
+        # Say which new-side path the masked cases below will actually take, so
+        # a failure can be attributed without re-deriving it from the env.
+        kern = importlib.import_module("model.kernels")
+        fused = kern.ENABLED and dev.type == "cuda"
+        print(f"new cells: triton AVAILABLE={kern.AVAILABLE} ENABLED={kern.ENABLED}"
+              f" -> masked steps run the {'Triton' if fused else 'torch'} path"
+              f" (CELL_KERNELS={os.environ.get('CELL_KERNELS', 'triton')})")
+        if fused:
+            print("       rerun with --no-kernels to test the fallback on its own")
 
         results: list[bool] = []
 
