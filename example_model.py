@@ -21,6 +21,7 @@ This means we can process multiple symbols in ONE forward pass!
   
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -32,6 +33,7 @@ import time
 import argparse
 from typing import Dict, List
 import torch
+import torch.nn as nn
 
 from huggingface_hub import hf_hub_download
 
@@ -46,6 +48,113 @@ def get_default_device() -> torch.device:
         return torch.device("mps")
     else:
         return torch.device("cpu")
+
+
+# Why store the weights in low precision instead of wrapping the forward pass in
+# torch.autocast: this model is memory-bandwidth bound, so what matters is the
+# number of parameter bytes streamed from HBM per event. Autocast leaves the
+# master weights in fp32 and re-casts them on every pass, which reads the full
+# fp32 tensor and then writes a bf16 copy - strictly more traffic, not less.
+# Holding the nn.Linear weights in bf16 halves the bytes actually read, and the
+# linears are where nearly all the parameters live.
+#
+# The cast back to fp32 on the way out is load-bearing, not cosmetic. Everything
+# that consumes a linear's output keeps fp32 weights or fp32 state: the Conv1d in
+# CausalConv1d, the einsum in BlockLinear, the RetNet rotary built from an int32
+# position counter, Hawk's sqrt(1 - a**2), and the running sums in Mamba2/xLSTM.
+# Those either fail outright on a mixed-dtype operand or drift once a long-lived
+# recurrent state is accumulated in 8 mantissa bits. So bf16 is confined to the
+# matmul itself; every module boundary still sees float32.
+class CastLinear(nn.Module):
+    """Drop-in replacement for nn.Linear that keeps its weights in low precision.
+
+    Casts the input down on entry and the result back to float32 on exit, so the
+    surrounding fp32 modules are unaware anything changed. Attribute names match
+    nn.Linear (weight, bias, in_features, out_features).
+    """
+
+    def __init__(self, linear: nn.Linear, dtype: torch.dtype = torch.bfloat16):
+        super().__init__()
+        self.in_features = linear.in_features
+        self.out_features = linear.out_features
+        self.compute_dtype = dtype
+
+        self.weight = nn.Parameter(
+            linear.weight.detach().to(dtype=dtype), requires_grad=False
+        )
+        if linear.bias is not None:
+            self.bias = nn.Parameter(
+                linear.bias.detach().to(dtype=dtype), requires_grad=False
+            )
+        else:
+            self.register_parameter("bias", None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.linear(
+            x.to(self.compute_dtype), self.weight, self.bias
+        ).to(torch.float32)
+
+    def extra_repr(self) -> str:
+        return (
+            f"in_features={self.in_features}, out_features={self.out_features}, "
+            f"bias={self.bias is not None}, compute_dtype={self.compute_dtype}"
+        )
+
+
+# These feed exponential decays, recurrent gate rescaling, or the final prediction, where
+# bf16 rounding compounds over the stream; ~0.2% of parameters, so fp32 costs no bandwidth.
+FP32_LINEAR_NAMES = ("dt_proj", "igate_proj", "fgate_proj", "output_proj")
+
+
+def convert_linears(
+    model: nn.Module,
+    dtype: torch.dtype,
+    skip_names: tuple[str, ...] = FP32_LINEAR_NAMES,
+) -> tuple[int, int]:
+    """Replace every nn.Linear in `model` with a CastLinear holding `dtype` weights.
+
+    An nn.Linear held under an attribute name in `skip_names` is left as it is,
+    so the precision-sensitive projections keep their fp32 weights. Returns
+    (converted, skipped), both counted per attribute site. Nothing else is
+    touched: BlockLinear, Conv1d, RMSNorm/LayerNorm/GroupNorm and every
+    recurrent state stay float32.
+    """
+    # Collect first, apply second: swapping modules while walking named_modules()
+    # would mutate the containers the walk is iterating over.
+    replacements: List[tuple] = []
+    skipped = 0
+    for _, parent in model.named_modules():
+        # Read _modules directly rather than named_children(), which silently
+        # skips a module that is reachable under two attribute names.
+        for child_name, child in parent._modules.items():
+            if isinstance(child, nn.Linear):
+                if child_name in skip_names:
+                    skipped += 1
+                else:
+                    replacements.append((parent, child_name, child))
+
+    converted: Dict[int, CastLinear] = {}
+    for parent, child_name, child in replacements:
+        new_module = converted.get(id(child))
+        if new_module is None:
+            new_module = CastLinear(child, dtype)
+            converted[id(child)] = new_module
+        if isinstance(parent, nn.ModuleList):
+            # Inside a ModuleList the attribute name is an index string ("3").
+            parent[int(child_name)] = new_module
+        else:
+            setattr(parent, child_name, new_module)
+
+    return len(replacements), skipped
+
+
+# Values accepted in the LINEAR_DTYPE environment variable.
+LINEAR_DTYPES = {
+    "bf16": torch.bfloat16,
+    "fp16": torch.float16,
+    "fp32": None,  # leave the linears alone
+}
+DEFAULT_LINEAR_DTYPE = "bf16"
 
 
 class NnInferenceClient(BaseInferenceClient):
@@ -87,6 +196,35 @@ class NnInferenceClient(BaseInferenceClient):
         )
         weights = torch.load(weights_file, weights_only=True)
         self.model.load_state_dict(weights)
+
+        # Swap the linears to low-precision storage. This happens after
+        # load_state_dict so the checkpoint still lands on plain fp32 nn.Linear
+        # modules, under the key names it was saved with.
+        requested = os.environ.get("LINEAR_DTYPE", DEFAULT_LINEAR_DTYPE).strip().lower()
+        if requested not in LINEAR_DTYPES:
+            print(
+                f"LINEAR_DTYPE={requested!r} is not one of "
+                f"{sorted(LINEAR_DTYPES)}; falling back to {DEFAULT_LINEAR_DTYPE}"
+            )
+            requested = DEFAULT_LINEAR_DTYPE
+        linear_dtype = LINEAR_DTYPES[requested]
+        is_cuda = torch.device(self.device).type == "cuda"
+
+        if is_cuda and linear_dtype is not None:
+            n_converted, n_skipped = convert_linears(self.model, linear_dtype)
+            print(
+                f"Converted {n_converted} linear layers to {requested} "
+                f"({n_skipped} kept fp32)"
+            )
+            # The fp32 originals are unreachable now; hand their blocks back.
+            torch.cuda.empty_cache()
+        else:
+            reason = (
+                "LINEAR_DTYPE=fp32"
+                if linear_dtype is None
+                else f"device is {torch.device(self.device).type}, not cuda"
+            )
+            print(f"Linear layers stay fp32 ({reason})")
 
         # Initialize a SINGLE batched state for ALL symbols
         self.batched_state = self.model.init_state(num_symbols, self.device)
