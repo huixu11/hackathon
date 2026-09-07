@@ -167,7 +167,7 @@ anything ships:
 | Variable | Values | Default | Effect |
 | --- | --- | --- | --- |
 | `LINEAR_DTYPE` | `fp16`, `bf16`, `fp32` | `fp16` | Storage dtype for the linear weights. `fp32` leaves them alone. Ignored off CUDA. The four sensitive projections stay fp32 regardless. |
-| `STEP_MODE` | `inductor`, `cudagraph`, `compile`, `eager` | `inductor` | How the step runs. `inductor` is torch.compile reduce-overhead, fused kernels replayed by cudagraph trees. `cudagraph` is a manual capture of the eager kernels. `compile` is torch.compile with no graphs, for profiling, since kineto then names each fused kernel. `eager` is the reference path and the only one that runs off CUDA. |
+| `STEP_MODE` | `inductor`, `blocks`, `cudagraph`, `compile`, `eager` | `inductor` | How the step runs. `inductor` is torch.compile reduce-overhead, fused kernels replayed by cudagraph trees. `blocks` compiles each `Block` on its own and then captures the step by hand, for inductor's kernels at a fraction of the compile time; see "Cold start". `cudagraph` is a manual capture of the eager kernels. `compile` is torch.compile with no graphs, for profiling, since kineto then names each fused kernel. `eager` is the reference path and the only one that runs off CUDA. |
 | `CELL_KERNELS` | `triton`, anything else | `triton` | Anything but `triton` forces the pure-torch reference path in the cells. The wrappers also fall back on their own when Triton is missing or the state is not on CUDA. |
 
 An unrecognized value for the first two prints a warning and falls back to the default.
@@ -226,14 +226,46 @@ of the round and produces no error anyone will notice in a leaderboard run.
 | Mode | First start | Warm inductor cache | Per-round cost |
 | --- | --- | --- | --- |
 | `inductor` (default) | about 95 s | about 18 s | baseline |
+| `blocks` | about 10 to 20 s, to be measured | to be measured | baseline within noise, to be measured |
 | `cudagraph` | about 1 s | about 1 s | about 2x baseline |
 | `eager` | immediate | immediate | far worse |
 
-Warm the cache before an event: run the client, or `profile_step.py`, once on the box with the same
-`TORCHINDUCTOR_CACHE_DIR` and `TRITON_CACHE_DIR` and the same `num_symbols` the real run will use. The
-compile is keyed by shape, so warming at 39 rows does nothing for a run at 64. If a run has to start
-cold under time pressure and cannot afford 95 s of silence, `STEP_MODE=cudagraph` starts in about a
-second and gives up roughly half the throughput; switch back once the cache is warm.
+The 95 s is a cost in the score, not just an annoyance. A session runs about 27 minutes at 400 requests
+per second, so a cold `inductor` start spends about six percent of it answering nothing.
+
+`blocks` is the fix for it. It applies `torch.compile` to each `Block` instead of to the whole step.
+Dynamo caches compiled code against the code object it traced, and all 48 blocks are instances of the
+same `Block` class running the same `Block.forward`, so the compiler runs once per distinct trace, four
+of them, one per tower's layer type, and the other 11 blocks of each type are served by the entry their
+variant already filled. It then captures the whole step by hand into a CUDA graph, exactly as
+`cudagraph` does, so a round is still a single replay, now over the fused kernels rather than the eager
+ones. Compiling `self._step` instead hands inductor one graph spanning all 48 blocks, and scheduling
+that graph is where the 95 s goes.
+
+Expect a cold start of about 10 to 20 s and a per-round cost equal to `inductor` within noise: at 64
+rows with 8 active that is the 18.7 ms `inductor` measures. Both are still to be measured on the box.
+The startup line prints the split, `compile N s, capture N s`, plus how many compiled variants dynamo
+ended up holding; more than four traces there means the blocks stopped sharing cache entries and the
+compile time is back, and the mode says so.
+
+To measure a cold start, point both caches at a fresh empty directory for that one run, or the compile
+being timed is served from disk and the number is a warm start wearing a cold label:
+
+```bash
+TORCHINDUCTOR_CACHE_DIR=/chronos_data/huixu/tmp/cold \
+TRITON_CACHE_DIR=/chronos_data/huixu/tmp/cold-triton \
+python profile_step.py --step-mode blocks --rounds 10 --num-symbols 64 --active 8
+```
+
+A new directory each time. The second run against the same one is warm, whatever it is called.
+
+Warm the cache before an event regardless: run the client, or `profile_step.py`, once on the box with
+the same `TORCHINDUCTOR_CACHE_DIR` and `TRITON_CACHE_DIR` and the same `num_symbols` the real run will
+use. The compile is keyed by shape, so warming at 39 rows does nothing for a run at 64. A warm cache is
+the cheapest start there is and the only one that costs nothing. If a run has to start cold under time
+pressure and cannot afford 95 s of silence, `STEP_MODE=blocks` is the first thing to reach for once its
+numbers are confirmed on the box, and `STEP_MODE=cudagraph` is the floor at about a second of startup
+and roughly half the throughput; switch back once the cache is warm.
 
 ## Symbol rows: `num_symbols` is a capacity
 
@@ -272,7 +304,10 @@ things could still be taken, in descending order of what they are worth here.
   could overlap and hide the per-kernel gaps. On the A6000 the round is close to bandwidth bound and
   there is little gap to hide; on an H100, where the matmuls are about a third of the cost, the gaps are
   a larger share and this matters more. It interacts with CUDA graph capture, which has to record the
-  side streams too.
+  side streams too, and that is what makes `blocks` the foundation for it: the capture there is built by
+  hand in `_capture_step`, so the fork onto four streams and the join before `output_proj` can be
+  written into the Python that gets recorded, and the graph then carries the overlap into every replay.
+  Under `inductor` the graph belongs to cudagraph trees and there is no seam to write it into.
 - **Fusing the remaining small kernels.** Norms, convolutions, gates and elementwise work are the
   balance of the round after the matmuls and the state kernels. Inductor already fuses much of it; what
   is left is a long tail of small launches inside the graph, so the win is real but bounded.

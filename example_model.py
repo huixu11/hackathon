@@ -176,12 +176,34 @@ def iter_state_tensors(state):
         yield state
 
 
-# Values accepted in the STEP_MODE environment variable. All four produce a
+# Values accepted in the STEP_MODE environment variable. All five produce a
 # self._step_fn() that runs the forward pass and folds the new state in; they
-# differ only in how much per-round launch overhead is paid to do it.
+# differ only in how much per-round launch overhead is paid to do it, and in
+# how much compilation is paid up front to get there.
 #
 #   inductor   torch.compile(mode="reduce-overhead"): inductor's kernels,
 #              replayed by cudagraph trees.
+#   blocks     the same fused kernels as inductor, reached in a fraction of the
+#              compile time, and replayed from a graph captured by hand.
+#              torch.compile is applied to each Block instead of to the whole
+#              step: dynamo caches compiled code against the code object it
+#              traced, and all 48 blocks share one Block.forward, so the
+#              compiler runs once per distinct trace - four, one per tower's
+#              layer type - and the other 44 blocks are served by the entry
+#              their variant already produced. (Per-Block torch.compile with
+#              cudagraphs pinned off, so nothing tries to capture inside the
+#              capture, plus fullgraph=True and dynamic=False; a hand-built
+#              CUDA graph of the whole step then goes over the top, exactly as
+#              in "cudagraph", so a round is still one replay.) Compiling
+#              self._step instead hands inductor one graph covering all 48
+#              blocks, which is where the ~95 s of "inductor" goes.
+#              Expect the per-round cost to land near "inductor" rather than on
+#              it: the block bodies are the same fused kernels, but what sits
+#              between the blocks stays eager here - each tower's input_up /
+#              input_down and output_proj, the concat, and the ~180 small state
+#              leaves _blend_state folds. Those are inside the graph, so they
+#              cost launches on the device and nothing on the host, but
+#              "inductor" gets to fuse them and this does not.
 #   cudagraph  the eager kernels, captured once by hand into a CUDA graph.
 #   compile    torch.compile with the default mode: inductor's kernels, but no
 #              CUDA graphs, so each one is launched on its own. Slower than
@@ -189,13 +211,38 @@ def iter_state_tensors(state):
 #              kernels individually, by name, instead of one graph launch.
 #   eager      no capture at all - the reference path, and the only one that
 #              runs anywhere but CUDA.
-STEP_MODES = ("inductor", "cudagraph", "compile", "eager")
+STEP_MODES = ("inductor", "blocks", "cudagraph", "compile", "eager")
 DEFAULT_STEP_MODE = "inductor"
 
 # Enough passes to settle whatever is autotuned before the graph is recorded:
 # inductor's kernel selection, cudnn.benchmark's algorithm search, and the
 # allocator blocks the capture will bake in.
 WARMUP_STEPS = 3
+
+
+def dynamo_variant_count(fn) -> int | None:
+    """How many compiled variants dynamo holds for `fn`'s code object.
+
+    The whole premise of STEP_MODE=blocks is that this number is the number of
+    tower types and not the number of blocks: dynamo keys its cache on the code
+    object, and with config.inline_inbuilt_nn_modules on (the torch 2.8 default)
+    a module's parameters enter the graph as inputs guarded by tensor properties
+    rather than by id, so one entry serves every Block instance whose layer has
+    the same type. Reading the count back is the only cheap way to see that it
+    actually happened - the alternative failure is silent, because past
+    config.recompile_limit dynamo stops compiling the frame and runs it eager,
+    which here would be an eager block recorded into the graph at full speed
+    cost and no error.
+
+    Private API, so None rather than an exception if it moves: the caller prints
+    what it gets and nothing depends on the answer.
+    """
+    try:
+        from torch._dynamo.eval_frame import _debug_get_cache_entry_list
+
+        return len(_debug_get_cache_entry_list(fn))
+    except Exception:
+        return None
 
 
 class NnInferenceClient(BaseInferenceClient):
@@ -403,6 +450,47 @@ class NnInferenceClient(BaseInferenceClient):
         self._graph.replay()
         return self._static_preds
 
+    def _capture_step(self) -> None:
+        """Record self._step into a CUDA graph and bind _step_fn to replaying it.
+
+        Shared by the two modes that build the graph by hand - "cudagraph",
+        which records the eager kernels, and "blocks", which records whatever
+        the per-Block compiles left behind. What is recorded differs; the
+        recording does not, so it lives in one place and the two cannot drift.
+
+        Whatever runs inside has to be fully warmed by the time capture starts:
+        capture records launches, not the Python that decides them, so a first
+        call that compiles, autotunes or allocates would bake that one call's
+        choices - or nothing at all - into the graph. WARMUP_STEPS passes with
+        an all-false mask do that warming, and leave batched_state untouched.
+        The passes have to be the ones the capture will record, so a mode whose
+        first call also COMPILES has to pay that call before getting here, or it
+        spends one of its three settled passes on the compiler; "blocks" does.
+        """
+        with torch.inference_mode():
+            # Mask all false, so the blend copies old into old and
+            # batched_state comes out of warmup and capture unchanged.
+            self._stage_idle_round()
+
+            # The warmup has to run on a side stream: capture records the
+            # allocations the step makes, and the caching allocator only
+            # hands out capture-safe blocks for a stream it has already
+            # seen the step run on.
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                for _ in range(WARMUP_STEPS):
+                    self._step()
+            torch.cuda.current_stream().wait_stream(s)
+
+            # Capture under inference_mode too, so the kernels recorded are
+            # the ones the real calls would have run.
+            self._graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self._graph):
+                self._static_preds = self._step()
+
+        self._step_fn = self._replay_graph
+
     def _setup_step_fn(self, is_cuda: bool) -> None:
         """Choose how _step runs, and pay whatever warmup that choice costs."""
         mode = os.environ.get("STEP_MODE", DEFAULT_STEP_MODE).strip().lower()
@@ -414,9 +502,14 @@ class NnInferenceClient(BaseInferenceClient):
             mode = DEFAULT_STEP_MODE
 
         if not is_cuda and mode != "eager":
-            # Every mode but eager is CUDA-only here: mark_static_address
-            # exists to feed cudagraph trees, CUDAGraph has no CPU or MPS
-            # analogue, and the warmup loops synchronize the CUDA stream.
+            # Every mode but eager is CUDA-only here - written as "not eager"
+            # rather than a list, so a mode added later is covered by default
+            # and has to opt out rather than remember to opt in. The reasons:
+            # mark_static_address exists to feed cudagraph trees, CUDAGraph has
+            # no CPU or MPS analogue, and the warmup loops synchronize the CUDA
+            # stream. "blocks" is CUDA-only for the second of those - the
+            # per-Block compiles alone would run anywhere, but the capture they
+            # feed would not.
             print(
                 f"STEP_MODE={mode} needs CUDA; device is "
                 f"{torch.device(self.device).type}, so the step runs eager"
@@ -424,6 +517,13 @@ class NnInferenceClient(BaseInferenceClient):
             mode = "eager"
 
         started = time.perf_counter()
+
+        # Only "blocks" fills these in, and only "blocks" prints them; bound
+        # here so the print below reads variables rather than maybe-unbound
+        # names. n_traces stays None when the private API that reads it moves.
+        n_wrapped = 0
+        n_traces: int | None = None
+        compile_s = 0.0
 
         if mode == "eager":
             self._step_fn = self._step
@@ -468,32 +568,154 @@ class NnInferenceClient(BaseInferenceClient):
                     self._step_fn()
                     torch.cuda.synchronize()
 
-        elif mode == "cudagraph":
+        elif mode == "blocks":
+            # Compile the Block, not the step. Dynamo caches compiled code
+            # against the code object it traced, and every one of the 48 blocks
+            # is an instance of the same Block class running the same
+            # Block.forward, so the compiler pays for four traces - one per
+            # tower's layer type - and the remaining 44 blocks are served by
+            # the cache entry their variant already filled. That is the whole
+            # difference from "inductor", which hands inductor a single graph
+            # spanning all 48 and takes about 95 s to schedule it.
+            #
+            # See the "inductor" branch above for why these imports are spelt
+            # `from torch import ...`.
+            from torch import _dynamo, _inductor  # noqa: F401
+
+            # What lets one cache entry serve all twelve blocks of a tower.
+            # With inlining on, a block's parameters and buffers enter the
+            # graph as INPUTS guarded by tensor properties; with it off, dynamo
+            # specializes the module by id and each of the 48 instances would
+            # miss the cache and compile again, which is the 95 s this mode
+            # exists to avoid. True is already the torch 2.8 default - set
+            # explicitly so the mode does not quietly become a 48-way recompile
+            # if the default (or the justknob behind it) ever moves.
+            torch._dynamo.config.inline_inbuilt_nn_modules = True
+
+            # The other way that inlining stops buying anything. Inductor's
+            # freezing pass wants the parameters folded in as constants, so
+            # dynamo asks for them by ADDRESS when it is on: builder.wrap_module
+            # calls mark_static_input(p, guard=is_parameter_freezing()), and a
+            # guarded static input is a data_ptr guard per parameter, which no
+            # other block can satisfy. is_parameter_freezing() is `freezing and
+            # not torch.is_grad_enabled()` and everything below runs under
+            # inference_mode, so here it is just `freezing`. Off by default; the
+            # global is what has to change, not the backend's options, because
+            # dynamo reads it while tracing, before the options are patched in
+            # around the backend call.
+            if torch._inductor.config.freezing:
+                print(
+                    "STEP_MODE=blocks is turning inductor freezing off: it "
+                    "guards every parameter by address, which would give each "
+                    "of the 48 blocks its own compile"
+                )
+                torch._inductor.config.freezing = False
+
+            # The recompile limit is counted per code object, and four variants
+            # now live under one. The 2.8 default of 8 would fit, but there is
+            # no reason to sit two entries under the cliff: past the limit
+            # dynamo stops compiling that frame and silently runs it eager,
+            # which here would mean an eager block captured into the graph and
+            # a per-round cost quietly back where it started. max(), not a bare
+            # assignment, so a caller that already raised it keeps its value.
+            torch._dynamo.config.cache_size_limit = max(
+                torch._dynamo.config.cache_size_limit, 16
+            )
+
+            # Wrap each block in place. nn.ModuleList.__setitem__ re-registers
+            # the entry, so the tower holds OptimizedModule wrappers from here
+            # on; Tower.forward reaches them as block(x, block_state,
+            # mask=mask) through nn.Module.__call__, which on an
+            # OptimizedModule runs the compiled forward and passes the mask
+            # keyword straight through.
+            #
+            # Wrapping is the only change to the module tree, and nothing else
+            # in the process needs the tree unwrapped. The linears are already
+            # CastLinear by now (convert_linears runs in __init__, well before
+            # this) and are ordinary modules that trace like any other.
+            # init_state is not called again either - self.batched_state was
+            # built in __init__, before _setup_step_fn - and would still work
+            # if it were: OptimizedModule.__getattr__ forwards an attribute it
+            # does not define to the module it wraps, so Tower.init_state's
+            # block.init_state(...) resolves to the real Block's.
+            #
+            # The class is read before the loop because after it there are no
+            # plain Blocks left to ask, and dynamo_variant_count needs the
+            # unwrapped Block.forward - the code object the cache is keyed on.
+            block_cls = type(self.model.towers[0].blocks[0])
+            for tower in self.model.towers:
+                for i in range(len(tower.blocks)):
+                    # fullgraph=True because a graph break inside a block would
+                    # put eager Python between the fused kernels, and the
+                    # capture below would record only the launches, not the
+                    # Python - better to fail loudly here. Nothing in the model
+                    # should break one: "inductor" traces this same code into a
+                    # single graph over all 48 blocks today, Triton launches
+                    # included. dynamic=False because the batch is
+                    # self.capacity forever, and letting dynamo mark it dynamic
+                    # would cost a recompile and give up the shape
+                    # specialization for nothing.
+                    #
+                    # triton.cudagraphs pinned off rather than left to its
+                    # default, which is `TORCHINDUCTOR_CUDAGRAPHS == "1"` and so
+                    # is one environment variable away from turning on. This
+                    # mode captures the step by hand; a compiled block that also
+                    # ran cudagraph trees would be capturing inside that
+                    # capture. Same options on every block, so all 48 backend
+                    # objects still compare equal, which is what lets them share
+                    # dynamo's cache entries (extra_state.cpp's backend_match
+                    # falls back to ==, and _TorchCompileInductorWrapper.__eq__
+                    # compares exactly this config and dynamic).
+                    tower.blocks[i] = torch.compile(
+                        tower.blocks[i],
+                        fullgraph=True,
+                        dynamic=False,
+                        options={"triton.cudagraphs": False},
+                    )
+                    n_wrapped += 1
+
+            # Pay the compiles here, not inside _capture_step. Dynamo traces on
+            # first call, so without this pass the first of the three warmups
+            # would be the one that compiles and autotunes, leaving only two
+            # settled passes before the capture where the other hand-captured
+            # mode gets three. An all-false mask throughout, so no state is
+            # touched however long the compiler takes.
             with torch.inference_mode():
-                # Mask all false, so the blend copies old into old and
-                # batched_state comes out of warmup and capture unchanged.
                 self._stage_idle_round()
+                self._step()
+                torch.cuda.synchronize()
 
-                # The warmup has to run on a side stream: capture records the
-                # allocations the step makes, and the caching allocator only
-                # hands out capture-safe blocks for a stream it has already
-                # seen the step run on.
-                s = torch.cuda.Stream()
-                s.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(s):
-                    for _ in range(WARMUP_STEPS):
-                        self._step()
-                torch.cuda.current_stream().wait_stream(s)
+            compile_s = time.perf_counter() - started
+            n_traces = dynamo_variant_count(block_cls.forward)
+            if n_traces is not None and n_traces > len(self.model.towers):
+                print(
+                    f"WARNING: dynamo holds {n_traces} compiled variants of "
+                    f"{block_cls.__name__}.forward; one per tower type "
+                    f"({len(self.model.towers)}) was expected. The blocks are "
+                    f"not sharing cache entries, so this mode is paying for "
+                    f"them one at a time, and past "
+                    f"torch._dynamo.config.cache_size_limit "
+                    f"({torch._dynamo.config.cache_size_limit}) the rest run "
+                    f"eager inside the captured graph."
+                )
 
-                # Capture under inference_mode too, so the kernels recorded are
-                # the ones the real calls would have run.
-                self._graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(self._graph):
-                    self._static_preds = self._step()
+            self._capture_step()
 
-            self._step_fn = self._replay_graph
+        elif mode == "cudagraph":
+            self._capture_step()
 
-        print(f"Step mode: {mode} (warmup {time.perf_counter() - started:.1f} s)")
+        elapsed = time.perf_counter() - started
+        if mode == "blocks":
+            # Split, because the two halves answer different questions: the
+            # compile number is the one this mode exists to shrink, and the
+            # trace count is the reason it is small.
+            print(
+                f"Step mode: {mode} ({n_wrapped} blocks wrapped, "
+                f"{'?' if n_traces is None else n_traces} traces, "
+                f"compile {compile_s:.1f} s, capture {elapsed - compile_s:.1f} s)"
+            )
+        else:
+            print(f"Step mode: {mode} (warmup {elapsed:.1f} s)")
 
     # On the class, not the instance: the overflow warning prints once per
     # process, and stays true afterwards.
