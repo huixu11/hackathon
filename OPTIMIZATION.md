@@ -226,7 +226,7 @@ of the round and produces no error anyone will notice in a leaderboard run.
 | Mode | First start | Warm inductor cache | Per-round cost |
 | --- | --- | --- | --- |
 | `inductor` | about 95 s (105.8 s measured at 64 rows) | about 18 s | 18.7 ms at 64 rows, 8 active |
-| `blocks` (default) | 16.6 s measured (compile 16.2 s, capture 0.4 s) | 14.5 s | 17.3 ms at 64 rows, 8 active |
+| `blocks` (default) | 16.6 s measured (compile 16.2 s, capture 0.4 s) | about 5 s | 17.3 ms at 64 rows, 8 active |
 | `cudagraph` | about 1 s | about 1 s | about 2x baseline |
 | `eager` | immediate | immediate | far worse |
 
@@ -244,8 +244,8 @@ that graph is where the 95 s goes.
 
 Measured on the A6000 at 64 rows with 8 active, caches pointed at empty directories: compile 16.2 s
 plus capture 0.4 s, four traces, and 17.3 ms per round against 18.7 ms for `inductor`, with the
-evaluator accuracy unchanged. A warm cache brings the start to about 14.5 s; what remains is tracing
-and warmup rather than compilation. That is about one percent of a session, down from six, so the
+evaluator accuracy unchanged. A warm cache brings the start to about 5 s (4.9 s measured once the
+four block graphs were on disk); what remains is tracing and warmup rather than compilation. That is about one percent of a session, down from six, so the
 cold start is considered solved and `blocks` is the default.
 The startup line prints the split, `compile N s, capture N s`, plus how many compiled variants dynamo
 ended up holding; more than four traces there means the blocks stopped sharing cache entries and the
