@@ -212,7 +212,7 @@ def iter_state_tensors(state):
 #   eager      no capture at all - the reference path, and the only one that
 #              runs anywhere but CUDA.
 STEP_MODES = ("inductor", "blocks", "cudagraph", "compile", "eager")
-DEFAULT_STEP_MODE = "inductor"
+DEFAULT_STEP_MODE = "blocks"
 
 # Enough passes to settle whatever is autotuned before the graph is recorded:
 # inductor's kernel selection, cudnn.benchmark's algorithm search, and the

@@ -70,7 +70,7 @@ def parse_args() -> argparse.Namespace:
                    help=f"Profiled calls. Default: min(--rounds, {DEFAULT_PROFILE_ROUNDS}).")
     p.add_argument("--step-mode", type=str, default="eager", choices=STEP_MODES,
                    help="Written to STEP_MODE before the client reads it. The "
-                        "client's own default is inductor; this defaults to "
+                        "client's own default is blocks; this defaults to "
                         "eager, the only mode the per-label attribution is "
                         "reliable in. compile names the fused kernels instead.")
     p.add_argument("--row-limit", type=int, default=25,

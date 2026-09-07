@@ -167,7 +167,7 @@ anything ships:
 | Variable | Values | Default | Effect |
 | --- | --- | --- | --- |
 | `LINEAR_DTYPE` | `fp16`, `bf16`, `fp32` | `fp16` | Storage dtype for the linear weights. `fp32` leaves them alone. Ignored off CUDA. The four sensitive projections stay fp32 regardless. |
-| `STEP_MODE` | `inductor`, `blocks`, `cudagraph`, `compile`, `eager` | `inductor` | How the step runs. `inductor` is torch.compile reduce-overhead, fused kernels replayed by cudagraph trees. `blocks` compiles each `Block` on its own and then captures the step by hand, for inductor's kernels at a fraction of the compile time; see "Cold start". `cudagraph` is a manual capture of the eager kernels. `compile` is torch.compile with no graphs, for profiling, since kineto then names each fused kernel. `eager` is the reference path and the only one that runs off CUDA. |
+| `STEP_MODE` | `blocks`, `inductor`, `cudagraph`, `compile`, `eager` | `blocks` | How the step runs. `inductor` is torch.compile reduce-overhead, fused kernels replayed by cudagraph trees. `blocks` compiles each `Block` on its own and then captures the step by hand, for inductor's kernels at a fraction of the compile time; see "Cold start". `cudagraph` is a manual capture of the eager kernels. `compile` is torch.compile with no graphs, for profiling, since kineto then names each fused kernel. `eager` is the reference path and the only one that runs off CUDA. |
 | `CELL_KERNELS` | `triton`, anything else | `triton` | Anything but `triton` forces the pure-torch reference path in the cells. The wrappers also fall back on their own when Triton is missing or the state is not on CUDA. |
 
 An unrecognized value for the first two prints a warning and falls back to the default.
@@ -225,8 +225,8 @@ of the round and produces no error anyone will notice in a leaderboard run.
 
 | Mode | First start | Warm inductor cache | Per-round cost |
 | --- | --- | --- | --- |
-| `inductor` (default) | about 95 s | about 18 s | baseline |
-| `blocks` | about 10 to 20 s, to be measured | to be measured | baseline within noise, to be measured |
+| `inductor` | about 95 s (105.8 s measured at 64 rows) | about 18 s | 18.7 ms at 64 rows, 8 active |
+| `blocks` (default) | 16.6 s measured (compile 16.2 s, capture 0.4 s) | 14.5 s | 17.3 ms at 64 rows, 8 active |
 | `cudagraph` | about 1 s | about 1 s | about 2x baseline |
 | `eager` | immediate | immediate | far worse |
 
@@ -242,8 +242,11 @@ variant already filled. It then captures the whole step by hand into a CUDA grap
 ones. Compiling `self._step` instead hands inductor one graph spanning all 48 blocks, and scheduling
 that graph is where the 95 s goes.
 
-Expect a cold start of about 10 to 20 s and a per-round cost equal to `inductor` within noise: at 64
-rows with 8 active that is the 18.7 ms `inductor` measures. Both are still to be measured on the box.
+Measured on the A6000 at 64 rows with 8 active, caches pointed at empty directories: compile 16.2 s
+plus capture 0.4 s, four traces, and 17.3 ms per round against 18.7 ms for `inductor`, with the
+evaluator accuracy unchanged. A warm cache brings the start to about 14.5 s; what remains is tracing
+and warmup rather than compilation. That is about one percent of a session, down from six, so the
+cold start is considered solved and `blocks` is the default.
 The startup line prints the split, `compile N s, capture N s`, plus how many compiled variants dynamo
 ended up holding; more than four traces there means the blocks stopped sharing cache entries and the
 compile time is back, and the mode says so.
@@ -263,8 +266,7 @@ Warm the cache before an event regardless: run the client, or `profile_step.py`,
 the same `TORCHINDUCTOR_CACHE_DIR` and `TRITON_CACHE_DIR` and the same `num_symbols` the real run will
 use. The compile is keyed by shape, so warming at 39 rows does nothing for a run at 64. A warm cache is
 the cheapest start there is and the only one that costs nothing. If a run has to start cold under time
-pressure and cannot afford 95 s of silence, `STEP_MODE=blocks` is the first thing to reach for once its
-numbers are confirmed on the box, and `STEP_MODE=cudagraph` is the floor at about a second of startup
+pressure, `blocks`, the default, starts in about 16 s cold, and `STEP_MODE=cudagraph` is the floor at about a second of startup
 and roughly half the throughput; switch back once the cache is warm.
 
 ## Symbol rows: `num_symbols` is a capacity
