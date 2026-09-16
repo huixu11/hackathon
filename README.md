@@ -1,3 +1,6 @@
+I have explained the details in 
+https://www.youtube.com/playlist?list=PLRGwYt6o-gIk
+
 ## The Hackathon Challenge
 
 ### What You're Optimizing
